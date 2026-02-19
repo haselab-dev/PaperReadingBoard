@@ -1,4 +1,5 @@
-const STORAGE_KEY = "lab_paper_tracker_v1";
+const SESSION_KEY = "lab_paper_tracker_session_uid";
+const POLL_INTERVAL_MS = 10000;
 
 const authPanel = document.getElementById("authPanel");
 const appPanel = document.getElementById("appPanel");
@@ -54,89 +55,30 @@ const topReadersList = document.getElementById("topReadersList");
 const navItems = [...document.querySelectorAll(".nav-item")];
 const pages = [...document.querySelectorAll(".page")];
 
-let trendChart = null;
-let currentUser = null;
 let usersCache = [];
 let papersCache = [];
+let objectivesByUid = {};
+let currentUser = null;
 let objectiveCache = null;
-let paperListMode = "all";
+
+let trendChart = null;
+let activePage = "dashboardPage";
 let selectedProfileUid = null;
 let editingPaperId = null;
+let paperListMode = "all";
 let paperSearchQuery = "";
 let paperPage = 1;
-const papersPerPage = 10;
+
 let objectiveTickerId = null;
+let pollerId = null;
+let syncInProgress = false;
 
-function loadStore() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-    return {
-      users: parsed.users || {},
-      papers: Array.isArray(parsed.papers) ? parsed.papers : [],
-      objectives: parsed.objectives || {},
-      sessionUid: parsed.sessionUid || null,
-    };
-  } catch {
-    return { users: {}, papers: [], objectives: {}, sessionUid: null };
-  }
-}
+const papersPerPage = 10;
 
-function saveStore(store) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-}
-
-function getStore() {
-  return loadStore();
-}
-
-function updateStore(mutator) {
-  const store = loadStore();
-  mutator(store);
-  saveStore(store);
-  syncFromStore();
-}
-
-function syncFromStore() {
-  const store = loadStore();
-  usersCache = Object.values(store.users);
-  papersCache = store.papers;
-  currentUser = store.sessionUid ? store.users[store.sessionUid] || null : null;
-  objectiveCache = currentUser ? store.objectives[currentUser.uid] || null : null;
-  renderKnownMembers();
-
-  if (!currentUser) {
-    showSignedOutView();
-    return;
-  }
-
-  clearErrors();
-  authPanel.classList.add("hidden");
-  appPanel.classList.remove("hidden");
-  userChip.classList.remove("hidden");
-  logoutBtn.classList.remove("hidden");
-  leaveBtn.classList.remove("hidden");
-  userChip.textContent = `${currentUser.displayName || currentUser.email}`;
-
-  selectedProfileUid = getProfileFromUrl();
-  renderMyStats();
-  renderObjectiveViews();
-  startObjectiveTicker();
-  renderCollaborationSnapshot();
-  renderLeaderboard();
-  renderPapersList();
-  renderSelectedProfile();
-  enforceObjectiveRequirement();
-
-  if (selectedProfileUid) {
-    navigateTo("profilePage", true);
-  } else {
-    navigateTo("dashboardPage", true);
-  }
-}
-
-joinForm.addEventListener("submit", (event) => {
+joinForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   clearErrors();
+
   const displayName = joinName.value.trim();
   const email = joinEmail.value.trim().toLowerCase();
 
@@ -144,56 +86,67 @@ joinForm.addEventListener("submit", (event) => {
     showErrorText("Please enter your name.");
     return;
   }
-
   if (!isValidEmail(email)) {
     showErrorText("Please enter a valid email address.");
     return;
   }
 
-  updateStore((store) => {
-    const existing = Object.values(store.users).find((u) => (u.email || "").toLowerCase() === email);
-
-    if (existing) {
-      existing.displayName = displayName;
-      store.sessionUid = existing.uid;
-      return;
+  joinBtn.disabled = true;
+  joinBtn.textContent = "Joining...";
+  try {
+    const result = await apiFetch("/api/join", {
+      method: "POST",
+      body: { displayName, email },
+    });
+    if (!result?.user?.uid) {
+      throw new Error("Join response is invalid.");
     }
-
-    const uid = generateId();
-    store.users[uid] = {
-      uid,
-      displayName,
-      email,
-      joinedAt: new Date().toISOString(),
-    };
-    store.sessionUid = uid;
-  });
-
-  joinForm.reset();
+    setSessionUid(result.user.uid);
+    joinForm.reset();
+    selectedProfileUid = null;
+    await refreshFromServer({ preservePage: false });
+  } catch (error) {
+    showErrorText(`Join failed: ${error.message}`);
+  } finally {
+    joinBtn.disabled = false;
+    joinBtn.textContent = "Join Workspace";
+  }
 });
 
-logoutBtn.addEventListener("click", () => {
-  updateStore((store) => {
-    store.sessionUid = null;
-  });
+logoutBtn.addEventListener("click", async () => {
+  setSessionUid(null);
+  selectedProfileUid = null;
+  showSignedOutView();
+  await refreshFromServer({ preservePage: false, silent: true });
 });
 
-leaveBtn.addEventListener("click", () => {
+leaveBtn.addEventListener("click", async () => {
   if (!currentUser) return;
   const confirmed = confirm(
-    "Leave workspace and delete your profile/objective and all your papers in this local browser?"
+    "Leave workspace and delete your profile/objective and all your papers for all members?"
   );
   if (!confirmed) return;
 
   const uid = currentUser.uid;
+  const oldLabel = leaveBtn.textContent;
+  leaveBtn.disabled = true;
+  leaveBtn.textContent = "Leaving...";
+
+  setSessionUid(null);
   showSignedOutView();
 
-  updateStore((store) => {
-    delete store.users[uid];
-    delete store.objectives[uid];
-    store.papers = store.papers.filter((p) => p.uid !== uid);
-    if (store.sessionUid === uid) store.sessionUid = null;
-  });
+  try {
+    await apiFetch(`/api/users/${encodeURIComponent(uid)}`, {
+      method: "DELETE",
+      body: { requestUid: uid },
+    });
+  } catch (error) {
+    showErrorText(`Leave failed: ${error.message}`);
+  } finally {
+    leaveBtn.disabled = false;
+    leaveBtn.textContent = oldLabel;
+    await refreshFromServer({ preservePage: false, silent: true });
+  }
 });
 
 showAllPapersBtn.addEventListener("click", () => {
@@ -250,12 +203,12 @@ for (const nav of navItems) {
 window.addEventListener("popstate", () => {
   selectedProfileUid = getProfileFromUrl();
   if (selectedProfileUid) {
-    navigateTo("profilePage", true);
+    navigateTo("profilePage", false);
   }
   renderSelectedProfile();
 });
 
-paperForm.addEventListener("submit", (event) => {
+paperForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!currentUser) return;
 
@@ -265,49 +218,59 @@ paperForm.addEventListener("submit", (event) => {
     return;
   }
 
-  const title = document.getElementById("paperTitle").value.trim();
-  const url = document.getElementById("paperUrl").value.trim();
-  const minutes = Number(document.getElementById("paperTime").value);
+  const paperTitle = document.getElementById("paperTitle").value.trim();
+  const paperUrl = document.getElementById("paperUrl").value.trim();
+  const readingMinutes = Number(document.getElementById("paperTime").value);
   const memoUrl = document.getElementById("memoUrl").value.trim();
 
-  if (!title || !safeUrl(url) || !safeUrl(memoUrl) || !Number.isFinite(minutes) || minutes <= 0) {
+  if (!paperTitle || !isWebUrl(paperUrl) || !isWebUrl(memoUrl) || !Number.isFinite(readingMinutes) || readingMinutes <= 0) {
     showErrorText("Please fill valid paper title/URL/memo URL/reading time.");
     return;
   }
 
-  updateStore((store) => {
+  paperSubmitBtn.disabled = true;
+  paperSubmitBtn.textContent = editingPaperId ? "Updating..." : "Saving...";
+
+  try {
     if (editingPaperId) {
-      const idx = store.papers.findIndex((p) => p.id === editingPaperId && p.uid === currentUser.uid);
-      if (idx >= 0) {
-        store.papers[idx] = {
-          ...store.papers[idx],
-          paperTitle: title,
-          paperUrl: url,
-          readingMinutes: minutes,
+      await apiFetch(`/api/papers/${encodeURIComponent(editingPaperId)}`, {
+        method: "PUT",
+        body: {
+          uid: currentUser.uid,
+          paperTitle,
+          paperUrl,
           memoUrl,
-          updatedAt: new Date().toISOString(),
-        };
-      }
+          readingMinutes,
+        },
+      });
     } else {
-      store.papers.push({
-        id: generateId(),
-        uid: currentUser.uid,
-        userName: currentUser.displayName || currentUser.email || "Unknown",
-        paperTitle: title,
-        paperUrl: url,
-        readingMinutes: minutes,
-        memoUrl,
-        readAt: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
+      await apiFetch("/api/papers", {
+        method: "POST",
+        body: {
+          uid: currentUser.uid,
+          paperTitle,
+          paperUrl,
+          memoUrl,
+          readingMinutes,
+        },
       });
     }
-  });
 
-  resetPaperFormMode();
-  clearErrors();
+    resetPaperFormMode();
+    clearErrors();
+    await refreshFromServer({ preservePage: true, silent: true });
+  } catch (error) {
+    showErrorText(`Could not save paper: ${error.message}`);
+  } finally {
+    paperSubmitBtn.disabled = false;
+    paperSubmitBtn.textContent = "Save Record";
+    if (editingPaperId) {
+      paperSubmitBtn.textContent = "Update Record";
+    }
+  }
 });
 
-objectiveForm.addEventListener("submit", (event) => {
+objectiveForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!currentUser) return;
 
@@ -333,29 +296,114 @@ objectiveForm.addEventListener("submit", (event) => {
   objectiveSubmitBtn.disabled = true;
   objectiveSubmitBtn.textContent = "Saving...";
 
-  updateStore((store) => {
-    if (!store.objectives[currentUser.uid]) {
-      store.objectives[currentUser.uid] = {
+  try {
+    await apiFetch("/api/objectives", {
+      method: "POST",
+      body: {
         uid: currentUser.uid,
         targetPapers,
         startDate,
         endDate,
-        createdAt: new Date().toISOString(),
-      };
-    }
-  });
-
-  objectiveSubmitBtn.disabled = false;
-  objectiveSubmitBtn.textContent = "Save Objective";
-  clearErrors();
-  navigateTo("dashboardPage", true);
+      },
+    });
+    clearErrors();
+    await refreshFromServer({ preservePage: true, silent: true });
+    navigateTo("dashboardPage", true);
+  } catch (error) {
+    showErrorText(`Could not save objective: ${error.message}`);
+  } finally {
+    objectiveSubmitBtn.disabled = false;
+    objectiveSubmitBtn.textContent = "Save Objective";
+  }
 });
 
-function navigateTo(pageId) {
+async function init() {
+  selectedProfileUid = getProfileFromUrl();
+  renderKnownMembers();
+  await refreshFromServer({ preservePage: false, silent: true });
+  startPolling();
+}
+
+async function refreshFromServer({ preservePage = true, silent = false } = {}) {
+  if (syncInProgress) return;
+  syncInProgress = true;
+  try {
+    const state = await apiFetch("/api/state");
+    usersCache = Array.isArray(state?.users) ? state.users : [];
+    papersCache = Array.isArray(state?.papers) ? state.papers : [];
+    objectivesByUid = state?.objectives && typeof state.objectives === "object" ? state.objectives : {};
+
+    const sessionUid = getSessionUid();
+    currentUser = sessionUid ? usersCache.find((u) => u.uid === sessionUid) || null : null;
+    objectiveCache = currentUser ? objectivesByUid[currentUser.uid] || null : null;
+
+    renderKnownMembers();
+
+    if (!currentUser) {
+      showSignedOutView();
+      return;
+    }
+
+    showSignedInShell();
+    renderMyStats();
+    renderObjectiveViews();
+    renderCollaborationSnapshot();
+    renderLeaderboard();
+    renderPapersList();
+    renderSelectedProfile();
+
+    if (selectedProfileUid) {
+      navigateTo("profilePage", false);
+    } else if (preservePage) {
+      navigateTo(activePage, false);
+    } else {
+      navigateTo("dashboardPage", false);
+    }
+
+    enforceObjectiveRequirement();
+    clearErrors();
+  } catch (error) {
+    if (!silent) {
+      showErrorText(`Sync failed: ${error.message}`);
+    }
+  } finally {
+    syncInProgress = false;
+  }
+}
+
+function showSignedInShell() {
+  authPanel.classList.add("hidden");
+  appPanel.classList.remove("hidden");
+  userChip.classList.remove("hidden");
+  logoutBtn.classList.remove("hidden");
+  leaveBtn.classList.remove("hidden");
+  userChip.textContent = `${currentUser.displayName || currentUser.email || "Unknown"}`;
+}
+
+function showSignedOutView() {
+  currentUser = null;
+  objectiveCache = null;
+  stopObjectiveTicker();
+  setSessionUid(null);
+
+  authPanel.classList.remove("hidden");
+  appPanel.classList.add("hidden");
+  userChip.classList.add("hidden");
+  logoutBtn.classList.add("hidden");
+  leaveBtn.classList.add("hidden");
+  userChip.textContent = "";
+
+  joinBtn.disabled = false;
+  resetPaperFormMode();
+}
+
+function navigateTo(pageId, fromUserAction = true) {
   let targetPage = pageId;
   if (!objectiveCache && targetPage !== "objectivePage") {
     targetPage = "objectivePage";
   }
+
+  activePage = targetPage;
 
   for (const page of pages) {
     page.classList.toggle("hidden", page.id !== targetPage);
@@ -369,6 +417,7 @@ function navigateTo(pageId) {
   }
 
   if (targetPage !== "profilePage") {
+    if (fromUserAction) selectedProfileUid = null;
     setProfileInUrl(null);
   }
 }
@@ -388,7 +437,7 @@ function renderKnownMembers() {
   }
 
   const sorted = [...usersCache].sort((a, b) =>
-    (a.displayName || a.email || "").localeCompare(b.displayName || b.email || "")
+    String(a.displayName || a.email || "").localeCompare(String(b.displayName || b.email || ""))
   );
 
   knownMembers.classList.remove("hidden");
@@ -398,7 +447,7 @@ function renderKnownMembers() {
       ${sorted
         .map(
           (u) =>
-            `<button type="button" data-quick-user="${escapeHtml(u.uid)}">${escapeHtml(
+            `<button type="button" data-quick-user="${escapeHtml(u.uid)}">Continue as ${escapeHtml(
               u.displayName || u.email || "Unknown"
             )}</button>`
         )
@@ -407,11 +456,11 @@ function renderKnownMembers() {
   `;
 
   knownMembers.querySelectorAll("[data-quick-user]").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const uid = btn.getAttribute("data-quick-user");
-      updateStore((store) => {
-        if (store.users[uid]) store.sessionUid = uid;
-      });
+      setSessionUid(uid);
+      selectedProfileUid = null;
+      await refreshFromServer({ preservePage: false });
     });
   });
 }
@@ -436,11 +485,9 @@ function renderCollaborationSnapshot() {
   const totalPapers = papersCache.length;
   const totalMinutes = papersCache.reduce((sum, p) => sum + (Number(p.readingMinutes) || 0), 0);
   const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
   const activeReaders = new Set(
-    papersCache
-      .filter((p) => new Date(p.readAt || 0).getTime() >= sevenDaysAgo)
-      .map((p) => p.uid)
-      .filter(Boolean)
+    papersCache.filter((p) => new Date(p.readAt || 0).getTime() >= sevenDaysAgo).map((p) => p.uid)
   ).size;
 
   teamMembersStat.textContent = `${totalMembers}`;
@@ -477,6 +524,7 @@ function renderCollaborationSnapshot() {
     curr.count += 1;
     rankMap.set(p.uid, curr);
   }
+
   const ranking = [...rankMap.values()].sort((a, b) => b.count - a.count).slice(0, 5);
   topReadersList.innerHTML = ranking.length
     ? ranking
@@ -487,7 +535,7 @@ function renderCollaborationSnapshot() {
             )}</button> · ${r.count} papers</li>`
         )
         .join("")
-    : "<li>No paper in the last 30 days.</li>";
+    : "<li>No papers in the last 30 days.</li>";
 
   topReadersList.querySelectorAll("[data-open-profile]").forEach((btn) => {
     btn.addEventListener("click", () => openProfile(btn.getAttribute("data-open-profile")));
@@ -555,7 +603,6 @@ function renderObjectiveViews() {
   const { targetPapers, startDate, endDate } = objectiveCache;
   const progress = targetPapers > 0 ? Math.min(100, Math.round((paperCount / targetPapers) * 100)) : 0;
   const remaining = Math.max(0, targetPapers - paperCount);
-  const timeMeta = getObjectiveTimeMeta(startDate, endDate);
   const startPretty = formatDateLong(startDate);
   const endPretty = formatDateLong(endDate);
 
@@ -566,9 +613,6 @@ function renderObjectiveViews() {
   `;
   objectiveBadge.textContent = `${progress}%`;
   objectiveProgressBar.style.width = `${progress}%`;
-  objectiveCountdown.textContent = `⏳ ${timeMeta.label}`;
-  objectivePageCountdown.classList.remove("hidden");
-  objectivePageCountdown.textContent = `⏳ ${timeMeta.label}`;
 
   objectiveForm.classList.add("hidden");
   objectiveSubmitBtn.disabled = true;
@@ -582,8 +626,11 @@ function renderObjectiveViews() {
       <div class="objective-chip">🗓️ Start: ${startPretty}</div>
       <div class="objective-chip">🏁 End: ${endPretty}</div>
     </div>
-    <p class="objective-countdown">⏳ ${timeMeta.label}</p>
+    <p id="objectiveLockCountdown" class="objective-countdown"></p>
   `;
+
+  updateObjectiveCountdown();
+  startObjectiveTicker();
 }
 
 function renderLeaderboard() {
@@ -679,10 +726,10 @@ function renderPapersList() {
         reader
       )}</button>`;
       const title = paper.paperTitle || "(No title)";
-      const paperLink = safeUrl(paper.paperUrl)
+      const paperLink = isWebUrl(paper.paperUrl)
         ? `<a href="${paper.paperUrl}" target="_blank" rel="noreferrer">${escapeHtml(title)}</a>`
         : escapeHtml(title);
-      const memoLink = safeUrl(paper.memoUrl)
+      const memoLink = isWebUrl(paper.memoUrl)
         ? `<a href="${paper.memoUrl}" target="_blank" rel="noreferrer">Open memo</a>`
         : "-";
 
@@ -711,13 +758,19 @@ function renderPapersList() {
   }
 
   papersBody.querySelectorAll("[data-delete-paper]").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const id = btn.getAttribute("data-delete-paper");
       const confirmed = confirm("Delete this paper record?");
-      if (!confirmed) return;
-      updateStore((store) => {
-        store.papers = store.papers.filter((p) => p.id !== id || p.uid !== currentUser.uid);
-      });
+      if (!confirmed || !currentUser) return;
+      try {
+        await apiFetch(`/api/papers/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          body: { uid: currentUser.uid },
+        });
+        await refreshFromServer({ preservePage: true, silent: true });
+      } catch (error) {
+        showErrorText(`Delete failed: ${error.message}`);
+      }
     });
   });
 
@@ -792,29 +845,32 @@ function renderSelectedProfile() {
   `;
 }
 
+function updateObjectiveCountdown() {
+  if (!objectiveCache) {
+    objectiveCountdown.textContent = "No objective countdown yet.";
+    objectivePageCountdown.classList.add("hidden");
+    objectivePageCountdown.textContent = "";
+    return;
+  }
+
+  const { startDate, endDate } = objectiveCache;
+  const timeMeta = getObjectiveTimeMeta(startDate, endDate);
+
+  objectiveCountdown.textContent = `⏳ ${timeMeta.label}`;
+  objectivePageCountdown.classList.remove("hidden");
+  objectivePageCountdown.textContent = `⏳ ${timeMeta.label}`;
+
+  const lockCountdown = document.getElementById("objectiveLockCountdown");
+  if (lockCountdown) {
+    lockCountdown.textContent = `⏳ ${timeMeta.label}`;
+  }
+}
+
 function openProfile(uid) {
   selectedProfileUid = uid || null;
   setProfileInUrl(selectedProfileUid);
   navigateTo("profilePage", true);
   renderSelectedProfile();
-}
-
-function showSignedOutView() {
-  currentUser = null;
-  objectiveCache = null;
-  selectedProfileUid = null;
-  stopObjectiveTicker();
-  authPanel.classList.remove("hidden");
-  appPanel.classList.add("hidden");
-  userChip.classList.add("hidden");
-  logoutBtn.classList.add("hidden");
-  leaveBtn.classList.add("hidden");
-  userChip.textContent = "";
-  joinBtn.disabled = false;
-  joinName.value = "";
-  joinEmail.value = "";
-  resetPaperFormMode();
-  clearErrors();
 }
 
 function resetPaperFormMode() {
@@ -823,6 +879,28 @@ function resetPaperFormMode() {
   paperFormMode.classList.add("hidden");
   paperSubmitBtn.textContent = "Save Record";
   cancelEditBtn.classList.add("hidden");
+}
+
+function startObjectiveTicker() {
+  stopObjectiveTicker();
+  if (!objectiveCache) return;
+  objectiveTickerId = setInterval(() => {
+    updateObjectiveCountdown();
+  }, 1000);
+}
+
+function stopObjectiveTicker() {
+  if (objectiveTickerId) {
+    clearInterval(objectiveTickerId);
+    objectiveTickerId = null;
+  }
+}
+
+function startPolling() {
+  if (pollerId) return;
+  pollerId = setInterval(() => {
+    refreshFromServer({ preservePage: true, silent: true });
+  }, POLL_INTERVAL_MS);
 }
 
 function getPastWeeks(weekCount) {
@@ -848,94 +926,6 @@ function getPastWeeks(weekCount) {
   return weeks;
 }
 
-function resolveUserName(uid) {
-  return usersCache.find((u) => u.uid === uid)?.displayName;
-}
-
-function formatDate(value) {
-  const d = new Date(value || 0);
-  if (Number.isNaN(d.getTime())) return "-";
-  return d.toLocaleDateString();
-}
-
-function formatDateLong(value) {
-  const d = new Date(value || 0);
-  if (Number.isNaN(d.getTime())) return "-";
-  return d.toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
-}
-
-function safeUrl(value) {
-  try {
-    const u = new URL(value);
-    return u.protocol === "http:" || u.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
-function isValidEmail(value) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
-}
-
-function relativeTime(value) {
-  const ts = new Date(value || 0).getTime();
-  if (!Number.isFinite(ts)) return "-";
-  const diff = Date.now() - ts;
-  const sec = Math.floor(diff / 1000);
-  if (sec < 60) return `${sec}s ago`;
-  const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const day = Math.floor(hr / 24);
-  if (day < 30) return `${day}d ago`;
-  return formatDate(value);
-}
-
-function escapeHtml(text) {
-  return String(text)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function getProfileFromUrl() {
-  const params = new URLSearchParams(window.location.search);
-  const uid = params.get("user");
-  return uid && uid.trim() ? uid.trim() : null;
-}
-
-function setProfileInUrl(uid) {
-  const url = new URL(window.location.href);
-  if (uid) {
-    url.searchParams.set("user", uid);
-  } else {
-    url.searchParams.delete("user");
-  }
-  window.history.replaceState({}, "", url);
-}
-
-function startObjectiveTicker() {
-  stopObjectiveTicker();
-  if (!objectiveCache) return;
-  objectiveTickerId = setInterval(() => {
-    renderObjectiveViews();
-  }, 1000);
-}
-
-function stopObjectiveTicker() {
-  if (objectiveTickerId) {
-    clearInterval(objectiveTickerId);
-    objectiveTickerId = null;
-  }
-}
-
 function getObjectiveTimeMeta(startDate, endDate) {
   const now = new Date();
   const start = new Date(`${startDate}T00:00:00`);
@@ -959,6 +949,128 @@ function formatCountdown(ms) {
   return `${days}d ${hours}h ${minutes}m ${seconds}s`;
 }
 
+function resolveUserName(uid) {
+  return usersCache.find((u) => u.uid === uid)?.displayName;
+}
+
+function formatDate(value) {
+  const d = new Date(value || 0);
+  if (Number.isNaN(d.getTime())) return "-";
+  return d.toLocaleDateString();
+}
+
+function formatDateLong(value) {
+  const d = new Date(value || 0);
+  if (Number.isNaN(d.getTime())) return "-";
+  return d.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function relativeTime(value) {
+  const ts = new Date(value || 0).getTime();
+  if (!Number.isFinite(ts)) return "-";
+
+  const diff = Date.now() - ts;
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}d ago`;
+  return formatDate(value);
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function isWebUrl(value) {
+  try {
+    const u = new URL(value);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function getProfileFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const uid = params.get("user");
+  return uid && uid.trim() ? uid.trim() : null;
+}
+
+function setProfileInUrl(uid) {
+  const url = new URL(window.location.href);
+  if (uid) {
+    url.searchParams.set("user", uid);
+  } else {
+    url.searchParams.delete("user");
+  }
+  window.history.replaceState({}, "", url);
+}
+
+function getSessionUid() {
+  return localStorage.getItem(SESSION_KEY);
+}
+
+function setSessionUid(uid) {
+  if (uid) {
+    localStorage.setItem(SESSION_KEY, uid);
+  } else {
+    localStorage.removeItem(SESSION_KEY);
+  }
+}
+
+async function apiFetch(url, options = {}) {
+  const fetchOptions = {
+    method: options.method || "GET",
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  };
+
+  if (options.body !== undefined) {
+    fetchOptions.body = JSON.stringify(options.body);
+  }
+
+  const response = await fetch(url, fetchOptions);
+
+  if (response.status === 204) {
+    return null;
+  }
+
+  const text = await response.text();
+  let payload = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { error: text };
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(payload?.error || `Request failed (${response.status})`);
+  }
+
+  return payload;
+}
+
 function clearErrors() {
   authError.classList.add("hidden");
   appError.classList.add("hidden");
@@ -976,11 +1088,4 @@ function showErrorText(message) {
   target.textContent = message;
 }
 
-function generateId() {
-  if (typeof crypto !== "undefined" && crypto.randomUUID) {
-    return crypto.randomUUID();
-  }
-  return `id_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
-}
-
-syncFromStore();
+init();

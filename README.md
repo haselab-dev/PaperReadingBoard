@@ -1,85 +1,79 @@
-# Lab Paper Tracker (Local Mode)
+# Lab Paper Tracker (Shared Server Mode)
 
-Web app for paper-reading logs in Hasegawa Laboratory, running fully in browser local storage.
+Paper-reading tracker for Hasegawa Laboratory with shared data across users/devices.
 
-## Features
+## What This Version Provides
 
-- Local `Join` flow (name + email) on first visit
-- Automatic returning-session authentication from local browser session
-- Paper record submission/edit/delete:
-  - paper title
-  - paper URL
-  - reading time
-  - memo link
-- Personal dashboard:
-  - paper count
-  - reading time statistics
-  - weekly trend chart
-- Objective management:
-  - one-time objective setup (immutable after save)
-  - progress tracking with progress bar
-- Shared leaderboard and profile views for all users stored in the same browser
-- Paper list search + pagination
-- Public profile URL routing (`?user=<uid>`)
+- Shared multi-user data via server API (not browser-only storage)
+- Join/continue with name + email
+- One-time objective setting with progress + countdown
+- Paper add/edit/delete (owner only)
+- Team leaderboard, member profiles, and collaboration snapshot
+- Search + pagination for paper records
 
-## Stack
+## Tech Stack
 
 - Frontend: HTML, CSS, JavaScript
-- Storage: Browser `localStorage`
-- Chart: Chart.js
+- Backend: Node.js + Express
+- Data store: `data/store.json` on server
 
-## Setup
+## Local Run
 
-1. Serve this folder with a local/static web server.
-2. Open in browser.
-
-Example:
+1. Install dependencies:
 
 ```bash
-npx serve .
+npm install
 ```
 
-No Firebase, OAuth, or external database is required.
+2. Start server:
 
-## Publish Public Link (GitHub Pages)
+```bash
+npm start
+```
 
-1. Create a GitHub repository and push this project.
-2. Keep your default branch name as `main` (or update workflow branch if different).
-3. In GitHub repository settings:
-   - Open `Settings` -> `Pages`
-   - Set `Source` to `GitHub Actions`
-4. Push to `main`. The included workflow deploys automatically.
-5. Your public URL will be:
-   - `https://<your-github-username>.github.io/<repo-name>/`
+3. Open:
 
-Included deployment files:
+- `http://localhost:3000`
 
-- `.github/workflows/deploy-pages.yml`
-- `.nojekyll`
+## Important for Shared Internet Use
 
-## Fast Publish Alternative (Netlify Drop)
+To share data across users/devices, everyone must access the **same deployed server**.
 
-If you want a quick temporary public URL without GitHub setup:
+### Deployment Options
 
-1. Open [Netlify Drop](https://app.netlify.com/drop)
-2. Drag and drop this project folder.
-3. Netlify immediately gives you a public link.
+Use a platform that supports Node servers:
 
-## Local Data Model (in localStorage)
+- Render (Web Service)
+- Railway
+- Fly.io
+- VPS (Ubuntu + PM2/Nginx)
 
-- `users` map by uid
-  - `uid`, `displayName`, `email`, `joinedAt`
-- `papers` array
-  - `id`, `uid`, `userName`, `paperTitle`, `paperUrl`, `readingMinutes`, `memoUrl`, `readAt`, `createdAt`, `updatedAt`
-- `objectives` map by uid
-  - `uid`, `targetPapers`, `startDate`, `endDate`, `createdAt`
-- `sessionUid`
-  - current signed-in local user
+### Persistence Requirement
 
-## Important Limitation
+This app stores data in `data/store.json`.
 
-This mode stores all data only in each browser's local storage.
+- If your host has ephemeral filesystem, data can reset on restart/redeploy.
+- Use persistent disk/volume, or replace file storage with managed DB.
+- You can set `DATA_DIR` env var to point to mounted persistent storage path.
 
-- Different devices/browsers do **not** automatically share data.
-- Clearing browser storage will erase data.
-- To support real multi-user shared data across devices, a backend (Firebase/Supabase/custom API) is required.
+## Project Structure
+
+- `server.js`: API + static file hosting
+- `app.js`: frontend UI logic and API integration
+- `index.html`, `styles.css`: UI
+- `data/store.json`: shared persisted data file
+
+## API Summary
+
+- `GET /api/state`
+- `POST /api/join`
+- `POST /api/objectives`
+- `POST /api/papers`
+- `PUT /api/papers/:id`
+- `DELETE /api/papers/:id`
+- `DELETE /api/users/:uid`
+
+## Security Note
+
+Current login is lightweight (name/email, no password).
+For stricter access control, add real authentication (OAuth/password/JWT) before production use.
