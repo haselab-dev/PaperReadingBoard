@@ -1,23 +1,24 @@
-# Lab Paper Tracker (Shared Server Mode)
+# Lab Paper Tracker (Shared + Decoupled Persistence)
 
 Paper-reading tracker for Hasegawa Laboratory with shared data across users/devices.
 
-## What This Version Provides
+## Goal for Railway Redeploy Safety
 
-- Shared multi-user data via server API (not browser-only storage)
-- Join/continue with name + email
-- One-time objective setting with progress + countdown
-- Paper add/edit/delete (owner only)
-- Team leaderboard, member profiles, and collaboration snapshot
-- Search + pagination for paper records
+This app now supports **decoupled persistence**:
 
-## Tech Stack
+- App server can be redeployed any time.
+- Data can live in an **external PostgreSQL database** that is independent of Railway app runtime.
+- If `DATABASE_URL` is configured, data is not tied to server local filesystem.
+
+## Stack
 
 - Frontend: HTML, CSS, JavaScript
 - Backend: Node.js + Express
-- Data store: `data/store.json` on server
+- Persistence:
+  - Preferred: PostgreSQL via `DATABASE_URL` (decoupled, persistent)
+  - Fallback: local JSON file (`data/store.json`)
 
-## Local Run
+## Quick Start (Local)
 
 1. Install dependencies:
 
@@ -25,46 +26,60 @@ Paper-reading tracker for Hasegawa Laboratory with shared data across users/devi
 npm install
 ```
 
-2. Start server:
+2. (Optional) configure `.env` from `.env.example`
+
+3. Start server:
 
 ```bash
 npm start
 ```
 
-3. Open:
+4. Open:
 
 - `http://localhost:3000`
 
-## Important for Shared Internet Use
+## Railway Deployment with Decoupled Data
 
-To share data across users/devices, everyone must access the **same deployed server**.
+### Recommended Architecture
 
-### Deployment Options
+- Deploy this app on Railway.
+- Use an **external Postgres provider** (Neon, Supabase, Aiven, ElephantSQL alternatives, etc.).
+- Set Railway environment variable:
+  - `DATABASE_URL=<external postgres connection string>`
 
-Use a platform that supports Node servers:
+This ensures app redeploy/restart does not wipe data.
 
-- Render (Web Service)
-- Railway
-- Fly.io
-- VPS (Ubuntu + PM2/Nginx)
+### One-Time Migration of Existing Local File Data
 
-### Persistence Requirement
+If you already have data in `data/store.json` and want to move it into Postgres:
 
-This app stores data in `data/store.json`.
+1. Set `DATABASE_URL` to your external Postgres.
+2. Set `BOOTSTRAP_FROM_FILE=true` for one deployment.
+3. Start the server once; it imports file data only when DB is empty.
+4. Remove `BOOTSTRAP_FROM_FILE` (or set it to `false`) after migration.
 
-- If your host has ephemeral filesystem, data can reset on restart/redeploy.
-- Use persistent disk/volume, or replace file storage with managed DB.
-- You can set `DATA_DIR` env var to point to mounted persistent storage path.
+### Notes
 
-## Project Structure
+- The server auto-creates required tables at startup.
+- No manual migration step is required for first run.
+- If your database requires custom SSL settings, set provider-appropriate connection params.
 
-- `server.js`: API + static file hosting
-- `app.js`: frontend UI logic and API integration
-- `index.html`, `styles.css`: UI
-- `data/store.json`: shared persisted data file
+## Environment Variables
 
-## API Summary
+- `DATABASE_URL`
+  - When set, PostgreSQL storage is used.
+- `DATA_DIR`
+  - Used only when `DATABASE_URL` is not set.
+- `BOOTSTRAP_FROM_FILE`
+  - Optional one-time migration switch from `data/store.json` to Postgres.
+- `PORT`
+  - Server port (default `3000`).
 
+See `.env.example`.
+
+## API Endpoints
+
+- `GET /api/health`
 - `GET /api/state`
 - `POST /api/join`
 - `POST /api/objectives`
@@ -75,5 +90,5 @@ This app stores data in `data/store.json`.
 
 ## Security Note
 
-Current login is lightweight (name/email, no password).
-For stricter access control, add real authentication (OAuth/password/JWT) before production use.
+Current login is lightweight (name/email only).
+For production security, add real authentication/authorization (OAuth/JWT/session hardening).
